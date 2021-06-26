@@ -2,12 +2,13 @@ import networkx as nx
 import pathFind as pf
 import nested_dict as nd
 import random as rn
-import csv
 from queue import PriorityQueue
 from math import inf
+import utils as ut
+import modification as md
 
 max = inf
-CBR = 648601
+CBR = ut.getBlockHeight()
 LND_RISK_FACTOR = 0.000000015
 C_RISK_FACTOR = 10
 RISK_BIAS = 1
@@ -35,7 +36,7 @@ def normalize(val, min, max):
 # as potential destinations.
 # For each potential destination, the set of sources that would use the same sub-path that we found during the search using either lnd, c-lightning or eclair
 # by calling the respective deanoniyize functions.
-def dest_reveal_new(G,adversary,delay,amount,pre,next):
+def _dest_reveal_new(G,adversary,delay,amount,pre,next):
     T = nd.nested_dict()
     flag1 = True
     anon_sets = nd.nested_dict()
@@ -152,6 +153,125 @@ def dest_reveal_new(G,adversary,delay,amount,pre,next):
         level = level - 1
     return anon_sets,flag1
 
+# Second attack strategy
+# First phase it collects possible destination starting from next
+# Second phase all nodes are checked to be a possible source for each destination, this is done for each LN client (LND, c-lightning, Eclair)
+def dest_reveal_new(G,adversary,delay,amount,pre,next):
+    T = nd.nested_dict()
+    flag1 = True
+    anon_sets = nd.nested_dict()
+    level = 0
+    index = 0
+    # Level 0 only contains the next node
+    T[0]["nodes"] = [next]
+    T[0]["delays"] = [delay]
+    print(delay)
+    T[0]["previous"] = [-1]
+    T[0]["visited"] = [[pre,adversary,next]]
+    T[0]["amounts"] = [amount]
+    x = -1
+
+    paths = nd.nested_dict()
+    num_paths = 0
+    # flag to indicate that going further would result only in invalid nodes as the delay limit is reached for all nodes in the current level
+    flag = True
+
+    while(flag):
+        level+=1
+        # Stop when level is greater than 3 - it takes forever otherwise
+        if(level == 4):
+            flag1 = False
+            break
+        t1 = T[level - 1]["nodes"]
+        d1 = T[level - 1]["delays"]
+        p1 = T[level - 1]["previous"]
+        v1 = T[level - 1]["visited"]
+        a1 = T[level - 1]["amounts"]
+        pr1 = T[level - 1]["probs"]
+        t2 = []
+        d2 = []
+        p2 = []
+        v2 = [[]]
+        a2 = []
+        pr2 = []
+        for i in range(0,len(t1)):
+            u = t1[i]
+            for [u,v] in G.out_edges(u):
+                # Checks if v is not repeating in the same path, delay limit is not reached after visiting v and the capacity condition is true after deducting fees
+                if(v!=pre and v!=adversary  and v!=next and v not in v1[i] and (d1[i] - G.edges[u,v]["Delay"])>=0 and (G.edges[u,v]["Balance"]+G.edges[v,u]["Balance"])>=((a1[i] - G.edges[u, v]["BaseFee"]) / (1 + G.edges[u, v]["FeeRate"]))):
+                    t2.append(v)
+                    d2.append(d1[i] - G.edges[u,v]["Delay"])
+                    p2.append(i)
+                    v2.append(v1[i]+[v])
+                    a2.append(((a1[i] - G.edges[u, v]["BaseFee"]) / (1 + G.edges[u, v]["FeeRate"])))
+          
+        T[level]["nodes"] = t2
+        #print(level,t2,d2)
+        T[level]["delays"] = d2
+        T[level]["previous"] = p2
+        T[level]["visited"] = v2
+        T[level]["amounts"] = a2
+        #T[level]["probs"] = pr2
+        #print(t2,d2,p2)
+        print(level,len(t2))
+        # Stop if the current level has 0 nodes
+        if(len(t2) == 0):
+            flag = False
+    level = level - 1
+    while(level>=0):
+        t = T[level]["nodes"]
+        d = T[level]["delays"]
+        p = T[level]["previous"]
+        a = T[level]["amounts"]
+        v = T[level]["visited"]
+        #print(level)
+        for i in range(0, len(t)):
+            # Potential destination if delay is 0
+            if(d[i] == 0):
+                possible_destination = T[level]["nodes"][i]
+                amount = T[level]["amounts"][i]
+                sources_lnd = set()
+                sources_c = set()
+                sources_ecl = set()
+                # For all possible sources
+                for source in G.nodes():
+                    if source == possible_destination or source == adversary:
+                        continue
+                    lnd_path, _, _, _ = pf.Dijkstra(G, source, possible_destination, amount, pf.lnd_cost_fun)
+                    if is_possible_path(G, lnd_path, adversary, pre, next):
+                        sources_lnd.add(source)
+
+                    paths = pf.Dijkstra_general(G, source, possible_destination, amount, pf.eclair_cost_fun)
+                    for idx in paths:
+                        if is_possible_path(G, paths[idx], adversary, pre, next):
+                            sources_lnd.add(source)
+
+                    c_path1, _, _, _ = pf.Dijkstra(G, source, possible_destination, amount, pf.c_cost_fun(-1))
+                    c_path2, _, _, _ = pf.Dijkstra(G, source, possible_destination, amount, pf.c_cost_fun(1))
+                    if is_possible_path(G, c_path1, adversary, pre, next) or is_possible_path(G, c_path2, adversary, pre, next):
+                        sources_lnd.add(source)
+
+                if len(sources_lnd) > 0:
+                    anon_sets[possible_destination]["lnd"] = list(sources_lnd)
+                if len(sources_c) > 0:
+                    anon_sets[possible_destination]["c"] = list(sources_c)
+                if len(sources_ecl) > 0:
+                    anon_sets[possible_destination]["ecl"] = list(sources_ecl)
+        level = level - 1
+    return anon_sets,flag1
+
+def is_possible_path(G, c_path, adversary, pre, next):
+    # If adversary, pre and next are on the path add to anon_set
+    if adversary in c_path and pre in c_path and next in c_path:
+        return True
+    else:
+        # check if adversary is connected to two subsequent nodes on the path
+        for j in range(len(c_path) - 1):
+            for [_, v] in G.out_edges(c_path[j]):
+                if v == adversary and c_path[j] == pre and c_path[j + 1] == next and G.has_edge(c_path[j], v) and G.has_edge(v, c_path[j + 1]):
+                    return True
+    return False
+
 # Returns potential sources that would use lnd to reach target using the subpath found. The key idea here is that we implement all sources Dijkstra for the given target
 # and the transaction amount. If at any point we find a discrepency between the found path and the path constructed using dijkstra for any node in the sub-path found, 
 # the target cannot be the real destination. If the complete sub-path matches the dijkstra condition, we proceed to find all possible sources that use this samme sub-path.
@@ -217,7 +337,8 @@ def deanonymize_lnd(G,target,path,amt):
         # the destination has to be the cheapest path from the intermediary to the destination.
         if(curr in path[1:]):
             ind = path.index(curr)
-            if(paths[curr]!=path[ind:]):
+            # Check if the current optimal path could be trasformed into the suboptimal path considered if random hops were added.
+            if md.is_not_possible_mod(path[ind:], paths[curr]):
                 return []
             if curr == adv:
                 flag1 = 1
@@ -225,11 +346,16 @@ def deanonymize_lnd(G,target,path,amt):
             # If pre is the source, the path from pre need to not match the path found since, the cost from the source to the second node is computed differently.
             # Moreover, the source would not choose the absolute cheapest path since the first hop may not have sufficient forward balance. 
             # Thus, pre has to be the source if the paths dont match, since the paths would only match if pre is an intermediary.
+            """
             if paths[pre] != path:
                 return [pre]
             else:
                 # if the paths do match, pre is just one possible source
                 sources.append(pre)
+            """
+            # Due to the fact that suboptimal path are now being used this assumption has been removed to avoid large amounts of false positives.
+            # Also bugs where the sender chooses a suboptimal path because of low forward balance while having a faster path with a large capacity channel are avoided.
+            sources.append(pre)
             flag2 = 1
         if flag1 == 1 and flag2 == 1:
             # since if pre is in the path from curr, the path from pre has to match the path we had found as it is the cheapest path from pre. This measns that curr
@@ -298,7 +424,8 @@ def deanonymize_c(G,target,path,amt,fuzz):
         # the destination has to be the cheapest path from the intermediary to the destination.
         if(curr in path[1:]):
             ind = path.index(curr)
-            if(paths[curr]!=path[ind:]):
+            # Check if the current optimal path could be trasformed into the suboptimal path considered if random hops were added.
+            if md.is_not_possible_mod(path[ind:], paths[curr]):
                 return []
             if curr == adv:
                 flag1 = 1
@@ -306,11 +433,16 @@ def deanonymize_c(G,target,path,amt,fuzz):
             # If pre is the source, the path from pre need to not match the path found since, the cost from the source to the second node is computed differently.
             # Moreover, the source would not choose the absolute cheapest path since the first hop may not have sufficient forward balance. 
             # Thus, pre has to be the source if the paths dont match, since the paths would only match if pre is an intermediary.
+            """
             if paths[pre] != path:
                 return [pre]
             else:
                 # if the paths do match, pre is just one possible source
                 sources.append(pre)
+            """
+            # Due to the fact that suboptimal path are now being used this assumption has been removed to avoid large amounts of false positives.
+            # Also bugs where the sender chooses a suboptimal path because of low forward balance while having a faster path with a large capacity channel are avoided.
+            sources.append(pre)
             flag2 = 1
         if flag1 == 1 and flag2 == 1:
             # since if pre is in the path from curr, the path from pre has to match the path we had found as it is the cheapest path from pre. This measns that curr
@@ -451,7 +583,10 @@ def deanonymize_ecl(G,target,pa,amt):
         if(curr in pa[1:]):
             ind = pa.index(curr)
             if visited[curr] == 3:
-                if (paths[curr] != pa[ind:] and paths1[curr] != pa[ind:] and paths2[curr] != pa[ind:]):
+                # The search will return an empty set only if all the top 3 paths cannot be transformed into the suboptimal one adding random hops.
+                if (md.is_not_possible_mod(pa[ind:], paths[curr])
+                    and md.is_not_possible_mod(pa[ind:], paths1[curr])
+                    and md.is_not_possible_mod(pa[ind:], paths2[curr])):
                     return []
             # If we find a match, then we do not need to look for other paths from curr
             if pa[ind:] == p:
@@ -463,6 +598,7 @@ def deanonymize_ecl(G,target,pa,amt):
             if pa == p or visited[curr] == 3:
                 visited[curr] = 3
                  # If pre is not an intermediary, then it must be the source
+            """
             if paths[pre] != pa and paths1[pre]!=pa and paths2[pre]!=pa:
                 if G.nodes[pre]["Tech"] != 2:
                     return []
@@ -472,12 +608,18 @@ def deanonymize_ecl(G,target,pa,amt):
                 if G.nodes[pre]["Tech"] == 2:
                     sources.append(pre)
                 flag2 = 1
+            """
+            # Due to the fact that suboptimal path are now being used this assumption has been removed to avoid large amounts of false positives.
+            # Also bugs where the sender chooses a suboptimal path because of low forward balance while having a faster path with a large capacity channel are avoided.
+            if G.nodes[pre]["Tech"] == 2:
+                sources.append(pre)
+            flag2 = 1
             # print(paths[curr], paths1[curr], paths2[curr])
         if flag1 == 1 and flag2 == 1:
                 # fill remaining possible sources
                 if pre in p:
                     for [v, curr] in G.in_edges(curr):
-                        if v not in p and G.nodes[v]["Tech"] == 2:
+                        if v not in paths[curr] and v not in paths1[curr] and v not in paths2[curr] and G.nodes[v]["Tech"] == 2:
                             sources.append(v)
 #                     ind = p.index(pre)
 #                     if p[ind:] == pa:

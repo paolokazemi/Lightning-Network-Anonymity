@@ -10,8 +10,10 @@ import math
 from math import inf
 import heapq
 from math import isinf
+import utils as ut
 
-CBR = 648601    # TODO: UPDATE CURRENT BLOCK BEFORE RUNNING!
+# Current block height
+CBR = ut.getBlockHeight()
 
 # lnd
 LND_RISK_FACTOR = 0.000000015
@@ -117,7 +119,7 @@ def calc_params(G, path, amt):
         dist += fee * (ndelay * DELAY_RATIO + ncapacity * CAPACITY_RATIO + nage * AGE_RATIO)
         delay += G.edges[path[i],path[i+1]]["Delay"]
         cost += fee
-    return dist
+    return cost, delay, dist
 
 # Find the best path based on the cost function using Dijkstra algo using priority queues
 def Dijkstra(G,source,target,amt,cost_function):
@@ -171,7 +173,7 @@ def Dijkstra(G,source,target,amt,cost_function):
                     amount[v] = amount[curr]
                     pq.put((dist[v],v))
                 # return [v]+paths[curr],delay[curr]+G.edges[v,curr]["Delay"],amount[curr],dist[curr]
-            if(G.edges[v, curr]["Balance"] + G.edges[curr, v]["Balance"] >= amount[curr]) and v not in visited:
+            if((v != source and G.edges[v, curr]["Balance"] + G.edges[curr, v]["Balance"] >= amount[curr]) or G.edges[v,curr]["Balance"]>=amount[curr]) and v not in visited:
                 cost = dist[curr] + cost_function(G,amount[curr],curr,v)
                 if cost < dist[v]:
                     dist[v] = cost
@@ -272,7 +274,7 @@ def modifiedEclair(G, source, target, amt, path=None):
     # print(B[0]["Path"])
     else:
         B[0] = path
-    paths = nd.nested_dict()
+    paths = PriorityQueue()
     leng = 0
     paths[leng]["Path"] = B[0]
     paths[leng]["Dist"] = calc_params(G, B[0], amt)
